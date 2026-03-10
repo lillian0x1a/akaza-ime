@@ -182,7 +182,8 @@ impl AkazaTextService {
                 => !state.is_empty(),
             0x41..=0x5A                                    // A-Z
                 => state.mode == InputMode::Hiragana || state.mode == InputMode::Converting,
-            0xBE | 0xBC | 0xBF | 0xBA | 0xBB | 0xBD      // 句読点・記号
+            0xBE | 0xBC | 0xBF | 0xBA | 0xBB | 0xBD       // 句読点・記号
+            | 0xDB | 0xDD                                  // [ ]
                 => state.mode == InputMode::Hiragana || !state.is_empty(),
             0x20 => !state.is_empty(),                     // Space
             0x0D => !state.is_empty(),                     // Enter
@@ -220,12 +221,14 @@ impl AkazaTextService {
             0x08 => self.handle_backspace(context)?,
             0x26 => self.handle_candidate_prev(context)?,
             0x28 => self.handle_candidate_next(context)?,
-            0xBE => self.handle_punctuation(context, '。')?,
-            0xBC => self.handle_punctuation(context, '、')?,
-            0xBF => self.handle_punctuation(context, '・')?,
-            0xBA => self.handle_punctuation(context, '：')?,
-            0xBB => self.handle_punctuation(context, '；')?,
-            0xBD => self.handle_punctuation(context, 'ー')?,
+            0xBE => self.handle_punctuation(context, '.', '。')?,
+            0xBC => self.handle_punctuation(context, ',', '、')?,
+            0xBF => self.handle_punctuation(context, '/', '・')?,
+            0xBA => self.handle_punctuation(context, ':', '：')?,
+            0xBB => self.handle_punctuation(context, ';', '；')?,
+            0xBD => self.handle_punctuation(context, '-', 'ー')?,
+            0xDB => self.handle_punctuation(context, '[', '「')?,
+            0xDD => self.handle_punctuation(context, ']', '」')?,
             _ => {}
         }
         Ok(())
@@ -259,24 +262,60 @@ impl AkazaTextService {
         self.update_composition(context)
     }
 
-    fn handle_punctuation(&self, context: &ITfContext, ch: char) -> Result<()> {
+    fn handle_punctuation(&self, context: &ITfContext, ascii_ch: char, fallback_ch: char) -> Result<()> {
         {
             let mut state = self.state.borrow_mut();
             if state.mode == InputMode::Converting {
                 drop(state);
                 self.handle_commit(context)?;
-                self.state.borrow_mut().preedit.push(ch);
-                return self.update_composition(context);
-            }
-            // 残りのローマ字をかなに変換
-            if !state.romaji_buffer.is_empty() {
+                let mut state = self.state.borrow_mut();
+                // 確定後、バッファに ASCII を追加して romkan で変換を試みる
+                state.romaji_buffer.push(ascii_ch);
                 if let Some(romkan) = romkan() {
                     let converted = romkan.to_hiragana(&state.romaji_buffer);
-                    state.preedit.push_str(&converted);
-                    state.romaji_buffer.clear();
+                    if converted != state.romaji_buffer {
+                        let (kana, pending) = split_kana_pending(&converted, &state.romaji_buffer);
+                        if !kana.is_empty() {
+                            state.preedit.push_str(&kana);
+                        }
+                        state.romaji_buffer = pending;
+                    } else {
+                        state.romaji_buffer.pop();
+                        state.preedit.push(fallback_ch);
+                    }
+                } else {
+                    state.romaji_buffer.pop();
+                    state.preedit.push(fallback_ch);
                 }
+                drop(state);
+                return self.update_composition(context);
             }
-            state.preedit.push(ch);
+
+            // バッファに ASCII を追加して romkan で変換を試みる
+            state.romaji_buffer.push(ascii_ch);
+            if let Some(romkan) = romkan() {
+                let converted = romkan.to_hiragana(&state.romaji_buffer);
+                if converted != state.romaji_buffer {
+                    // romkan が変換した (例: "." → "。", "z." → "…")
+                    let (kana, pending) = split_kana_pending(&converted, &state.romaji_buffer);
+                    if !kana.is_empty() {
+                        state.preedit.push_str(&kana);
+                    }
+                    state.romaji_buffer = pending;
+                } else {
+                    // romkan に該当なし → フォールバック文字を使う
+                    state.romaji_buffer.pop();
+                    if !state.romaji_buffer.is_empty() {
+                        let flushed = romkan.to_hiragana(&state.romaji_buffer);
+                        state.preedit.push_str(&flushed);
+                        state.romaji_buffer.clear();
+                    }
+                    state.preedit.push(fallback_ch);
+                }
+            } else {
+                state.romaji_buffer.pop();
+                state.preedit.push(fallback_ch);
+            }
         }
         self.update_composition(context)
     }
