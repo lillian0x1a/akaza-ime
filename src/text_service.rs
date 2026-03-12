@@ -1031,28 +1031,9 @@ impl ITfTextInputProcessor_Impl for AkazaTextService_Impl {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             log("Deactivate: start");
 
-            // アクティブなコンポジションがあれば EndComposition で終了する
-            if let Ok(mut comp_ref) = self.composition.try_borrow_mut() {
-                if let Some(comp) = comp_ref.take() {
-                    let client_id = *self.client_id.borrow();
-                    let thread_mgr = self.thread_mgr.borrow();
-                    if let Some(thread_mgr) = thread_mgr.as_ref() {
-                        if let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() } {
-                            if let Ok(context) = unsafe { doc_mgr.GetTop() } {
-                                let _ = EditSession::execute(
-                                    &context,
-                                    client_id,
-                                    TF_ES_READWRITE,
-                                    move |_ctx, ec| unsafe {
-                                        let _ = comp.EndComposition(ec);
-                                        Ok(())
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            // コンポジション参照を解放する
+            // (TSF が OnCompositionTerminated を呼んでクリーンアップする)
+            let _ = self.composition.try_borrow_mut().map(|mut c| c.take());
 
             let _ = AkazaTextService::unadvise_key_event_sink(self);
             self.state.borrow_mut().reset();
