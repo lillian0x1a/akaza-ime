@@ -19,12 +19,12 @@ pub struct InputState {
     pub romaji_buffer: String,
     /// 変換前のひらがな
     pub preedit: String,
-    /// 変換候補リスト
-    pub candidates: Vec<String>,
-    /// 選択中の候補インデックス
-    pub candidate_index: usize,
-    /// 変換セグメント情報 (学習用) — segments[candidate_index] が選択中の候補に対応
+    /// セグメントごとの候補リスト: segments[seg_idx][cand_idx]
     pub segments: Vec<Vec<Candidate>>,
+    /// 各セグメントで選択中の候補インデックス
+    pub segment_indices: Vec<usize>,
+    /// フォーカス中のセグメントインデックス
+    pub focus_segment: usize,
 }
 
 impl InputState {
@@ -33,18 +33,18 @@ impl InputState {
             mode: InputMode::Direct,
             romaji_buffer: String::new(),
             preedit: String::new(),
-            candidates: Vec::new(),
-            candidate_index: 0,
             segments: Vec::new(),
+            segment_indices: Vec::new(),
+            focus_segment: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.romaji_buffer.clear();
         self.preedit.clear();
-        self.candidates.clear();
-        self.candidate_index = 0;
         self.segments.clear();
+        self.segment_indices.clear();
+        self.focus_segment = 0;
         // Converting → Hiragana に戻す。Direct はそのまま維持。
         if self.mode == InputMode::Converting {
             self.mode = InputMode::Hiragana;
@@ -53,8 +53,8 @@ impl InputState {
 
     /// 確定するテキストを返す
     pub fn commit_text(&self) -> String {
-        if self.mode == InputMode::Converting && !self.candidates.is_empty() {
-            self.candidates[self.candidate_index].clone()
+        if self.mode == InputMode::Converting && !self.segments.is_empty() {
+            self.composed_text()
         } else {
             self.preedit.clone()
         }
@@ -62,12 +62,46 @@ impl InputState {
 
     /// プリエディットとして表示するテキスト
     pub fn display_text(&self) -> String {
-        if self.mode == InputMode::Converting && !self.candidates.is_empty() {
-            self.candidates[self.candidate_index].clone()
+        if self.mode == InputMode::Converting && !self.segments.is_empty() {
+            self.composed_text()
         } else {
             // ひらがな + 未変換ローマ字
             format!("{}{}", self.preedit, self.romaji_buffer)
         }
+    }
+
+    /// セグメントごとの選択候補を結合したテキスト
+    fn composed_text(&self) -> String {
+        self.segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                let idx = self.segment_indices.get(i).copied().unwrap_or(0);
+                seg.get(idx)
+                    .map(|c| c.surface.as_str())
+                    .unwrap_or("")
+            })
+            .collect()
+    }
+
+    /// フォーカス中セグメントの選択候補を返す
+    #[allow(dead_code)]
+    pub fn focused_candidate(&self) -> Option<&Candidate> {
+        let seg = self.segments.get(self.focus_segment)?;
+        let idx = self.segment_indices.get(self.focus_segment).copied().unwrap_or(0);
+        seg.get(idx)
+    }
+
+    /// 学習用: 各セグメントの選択済み候補を返す
+    pub fn selected_candidates(&self) -> Vec<Candidate> {
+        self.segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, seg)| {
+                let idx = self.segment_indices.get(i).copied().unwrap_or(0);
+                seg.get(idx).cloned()
+            })
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {

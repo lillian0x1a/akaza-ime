@@ -432,6 +432,8 @@ impl AkazaTextService {
             "erase_character_before_cursor" => self.handle_backspace(context),
             "cursor_up" => self.handle_candidate_prev(context),
             "cursor_down" => self.handle_candidate_next(context),
+            "cursor_left" => self.handle_segment_prev(context),
+            "cursor_right" => self.handle_segment_next(context),
             "convert_to_full_hiragana" => self.handle_convert_to_hiragana(context),
             "convert_to_full_katakana" => self.handle_convert_to_katakana(context),
             _ => {
@@ -535,8 +537,16 @@ impl AkazaTextService {
         let mut state = self.state.borrow_mut();
 
         if state.mode == InputMode::Converting {
-            if !state.candidates.is_empty() {
-                state.candidate_index = (state.candidate_index + 1) % state.candidates.len();
+            // 変換中にスペース → フォーカスセグメントの次の候補
+            let seg_idx = state.focus_segment;
+            if let Some(seg) = state.segments.get(seg_idx) {
+                if !seg.is_empty() {
+                    let cur = state.segment_indices.get(seg_idx).copied().unwrap_or(0);
+                    let next = (cur + 1) % seg.len();
+                    if let Some(si) = state.segment_indices.get_mut(seg_idx) {
+                        *si = next;
+                    }
+                }
             }
             drop(state);
             return self.update_composition(context);
@@ -556,25 +566,31 @@ impl AkazaTextService {
         let hiragana = state.preedit.clone();
         drop(state);
 
-        let (candidates, segments) = self.convert_candidates(&hiragana);
+        let segments = self.convert_segments(&hiragana);
 
         let mut state = self.state.borrow_mut();
-        if candidates.is_empty() {
-            state.candidates = vec![hiragana];
+        if segments.is_empty() {
+            // エンジンが変換できなかった場合、ひらがなをそのまま単一セグメントに
+            state.segments = vec![vec![Candidate {
+                surface: hiragana.clone(),
+                yomi: hiragana,
+                cost: 0.0,
+                compound_word: false,
+            }]];
         } else {
-            state.candidates = candidates;
+            state.segments = segments;
         }
-        state.segments = segments;
-        state.candidate_index = 0;
+        state.segment_indices = vec![0; state.segments.len()];
+        state.focus_segment = 0;
         state.mode = InputMode::Converting;
         drop(state);
 
         self.update_composition(context)
     }
 
-    fn convert_candidates(&self, hiragana: &str) -> (Vec<String>, Vec<Vec<Candidate>>) {
-        let mut candidates = Vec::new();
-        let mut all_segments = Vec::new();
+    /// エンジンから変換結果をセグメント×候補の形で取得
+    fn convert_segments(&self, hiragana: &str) -> Vec<Vec<Candidate>> {
+        let mut result: Vec<Vec<Candidate>> = Vec::new();
 
         THREAD_ENGINE.with(|e| {
             let mut engine = e.borrow_mut();
@@ -582,48 +598,10 @@ impl AkazaTextService {
             let Ok(segments) = engine.convert(hiragana, None) else {
                 return;
             };
-
-            if segments.len() == 1 {
-                for cand in &segments[0] {
-                    if !candidates.contains(&cand.surface) {
-                        candidates.push(cand.surface.clone());
-                        all_segments.push(vec![cand.clone()]);
-                    }
-                }
-            } else {
-                let main: String = segments
-                    .iter()
-                    .filter_map(|seg| seg.first().map(|c| c.surface.as_str()))
-                    .collect();
-                let main_segs: Vec<_> = segments
-                    .iter()
-                    .filter_map(|seg| seg.first().cloned())
-                    .collect();
-                candidates.push(main);
-                all_segments.push(main_segs);
-
-                if let Ok(paths) = engine.convert_k_best(hiragana, None, 5) {
-                    for path in &paths {
-                        let text: String = path
-                            .segments
-                            .iter()
-                            .filter_map(|seg| seg.first().map(|c| c.surface.as_str()))
-                            .collect();
-                        if !candidates.contains(&text) {
-                            let segs: Vec<_> = path
-                                .segments
-                                .iter()
-                                .filter_map(|seg| seg.first().cloned())
-                                .collect();
-                            candidates.push(text);
-                            all_segments.push(segs);
-                        }
-                    }
-                }
-            }
+            result = segments;
         });
 
-        (candidates, all_segments)
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -633,17 +611,20 @@ impl AkazaTextService {
     fn handle_convert_to_hiragana(&self, context: &ITfContext) -> Result<()> {
         let preedit = {
             let state = self.state.borrow();
-            if state.mode == InputMode::Converting {
-                // 変換中 → ひらがなに戻す
-                state.preedit.clone()
-            } else {
+            if state.mode != InputMode::Converting {
                 return Ok(());
             }
+            state.preedit.clone()
         };
         let mut state = self.state.borrow_mut();
-        state.candidates = vec![preedit];
-        state.segments.clear();
-        state.candidate_index = 0;
+        state.segments = vec![vec![Candidate {
+            surface: preedit.clone(),
+            yomi: preedit,
+            cost: 0.0,
+            compound_word: false,
+        }]];
+        state.segment_indices = vec![0];
+        state.focus_segment = 0;
         drop(state);
         self.update_composition(context)
     }
@@ -654,7 +635,6 @@ impl AkazaTextService {
             if state.mode != InputMode::Converting && state.mode != InputMode::Hiragana {
                 return Ok(());
             }
-            // ローマ字バッファをフラッシュ
             if !state.romaji_buffer.is_empty() {
                 if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                     state.preedit.push_str(&converted);
@@ -676,9 +656,14 @@ impl AkazaTextService {
             .collect();
 
         let mut state = self.state.borrow_mut();
-        state.candidates = vec![katakana];
-        state.segments.clear();
-        state.candidate_index = 0;
+        state.segments = vec![vec![Candidate {
+            surface: katakana,
+            yomi: hiragana,
+            cost: 0.0,
+            compound_word: false,
+        }]];
+        state.segment_indices = vec![0];
+        state.focus_segment = 0;
         state.mode = InputMode::Converting;
         drop(state);
         self.update_composition(context)
@@ -693,12 +678,12 @@ impl AkazaTextService {
         if state.mode != InputMode::Converting || state.segments.is_empty() {
             return;
         }
-        if let Some(segs) = state.segments.get(state.candidate_index) {
-            let segs = segs.clone();
-            drop(state);
+        let selected = state.selected_candidates();
+        drop(state);
+        if !selected.is_empty() {
             THREAD_ENGINE.with(|e| {
                 if let Some(engine) = e.borrow_mut().as_mut() {
-                    engine.learn(&segs);
+                    engine.learn(&selected);
                 }
             });
         }
@@ -817,8 +802,9 @@ impl AkazaTextService {
         {
             let mut state = self.state.borrow_mut();
             if state.mode == InputMode::Converting {
-                state.candidates.clear();
-                state.candidate_index = 0;
+                state.segments.clear();
+                state.segment_indices.clear();
+                state.focus_segment = 0;
                 state.mode = InputMode::Hiragana;
             } else if !state.romaji_buffer.is_empty() {
                 state.romaji_buffer.pop();
@@ -840,8 +826,18 @@ impl AkazaTextService {
     fn handle_candidate_prev(&self, context: &ITfContext) -> Result<()> {
         {
             let mut state = self.state.borrow_mut();
-            if !state.candidates.is_empty() && state.candidate_index > 0 {
-                state.candidate_index -= 1;
+            if state.mode == InputMode::Converting {
+                let seg_idx = state.focus_segment;
+                if let Some(seg) = state.segments.get(seg_idx) {
+                    if !seg.is_empty() {
+                        let cur = state.segment_indices.get(seg_idx).copied().unwrap_or(0);
+                        if cur > 0 {
+                            if let Some(si) = state.segment_indices.get_mut(seg_idx) {
+                                *si = cur - 1;
+                            }
+                        }
+                    }
+                }
             }
         }
         self.update_composition(context)
@@ -850,9 +846,39 @@ impl AkazaTextService {
     fn handle_candidate_next(&self, context: &ITfContext) -> Result<()> {
         {
             let mut state = self.state.borrow_mut();
-            if !state.candidates.is_empty() {
-                state.candidate_index =
-                    (state.candidate_index + 1).min(state.candidates.len() - 1);
+            if state.mode == InputMode::Converting {
+                let seg_idx = state.focus_segment;
+                if let Some(seg) = state.segments.get(seg_idx) {
+                    if !seg.is_empty() {
+                        let cur = state.segment_indices.get(seg_idx).copied().unwrap_or(0);
+                        let next = (cur + 1).min(seg.len() - 1);
+                        if let Some(si) = state.segment_indices.get_mut(seg_idx) {
+                            *si = next;
+                        }
+                    }
+                }
+            }
+        }
+        self.update_composition(context)
+    }
+
+    fn handle_segment_prev(&self, context: &ITfContext) -> Result<()> {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.mode == InputMode::Converting && state.focus_segment > 0 {
+                state.focus_segment -= 1;
+            }
+        }
+        self.update_composition(context)
+    }
+
+    fn handle_segment_next(&self, context: &ITfContext) -> Result<()> {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.mode == InputMode::Converting
+                && state.focus_segment + 1 < state.segments.len()
+            {
+                state.focus_segment += 1;
             }
         }
         self.update_composition(context)
