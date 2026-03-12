@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::OnceLock;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -71,13 +70,14 @@ thread_local! {
     static THREAD_ENGINE: RefCell<Option<Box<dyn HenkanEngine>>> = const { RefCell::new(None) };
     static ENGINE_LOADED: RefCell<bool> = const { RefCell::new(false) };
     static THREAD_KEYMAP: RefCell<Option<HashMap<KeyPattern, String>>> = const { RefCell::new(None) };
+    static THREAD_ROMKAN: RefCell<Option<RomKanConverter>> = const { RefCell::new(None) };
 }
 
-fn romkan() -> Option<&'static RomKanConverter> {
-    static ROMKAN: OnceLock<Option<RomKanConverter>> = OnceLock::new();
-    ROMKAN
-        .get_or_init(|| RomKanConverter::default_mapping().ok())
-        .as_ref()
+fn romkan_convert(input: &str) -> Option<String> {
+    THREAD_ROMKAN.with(|r| {
+        let r = r.borrow();
+        r.as_ref().map(|rk| rk.to_hiragana(input))
+    })
 }
 
 fn load_engine() -> Option<Box<dyn HenkanEngine>> {
@@ -116,7 +116,7 @@ fn ensure_engine() {
         if let Some(engine) = load_engine() {
             THREAD_ENGINE.with(|e| *e.borrow_mut() = Some(engine));
         }
-        // キーマップもロード
+        // キーマップをロード
         let config = Config::load().unwrap_or_default();
         match Keymap::load(&config.keymap) {
             Ok(km) => {
@@ -125,7 +125,19 @@ fn ensure_engine() {
             }
             Err(e) => log(&format!("keymap: load error: {e}")),
         }
+        // romkan をロード
+        match RomKanConverter::default_mapping() {
+            Ok(rk) => {
+                log("romkan: loaded");
+                THREAD_ROMKAN.with(|r| *r.borrow_mut() = Some(rk));
+            }
+            Err(e) => log(&format!("romkan: load error: {e}")),
+        }
     });
+}
+
+fn invalidate_engine() {
+    ENGINE_LOADED.with(|loaded| *loaded.borrow_mut() = false);
 }
 
 fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
@@ -183,17 +195,26 @@ fn vk_to_key_name(vk: u32) -> Option<&'static str> {
     }
 }
 
-/// VK コードを句読点の ASCII 文字に変換
-fn vk_to_punct(vk: u32) -> Option<(char, char)> {
-    match vk {
-        0xBE => Some(('.', '。')),
-        0xBC => Some((',', '、')),
-        0xBF => Some(('/', '・')),
-        0xBA => Some((':', '：')),
-        0xBB => Some((';', '；')),
-        0xBD => Some(('-', 'ー')),
-        0xDB => Some(('[', '「')),
-        0xDD => Some((']', '」')),
+/// VK コードを句読点の ASCII 文字に変換 (Shift 考慮)
+fn vk_to_punct(vk: u32, shift: bool) -> Option<(char, char)> {
+    match (vk, shift) {
+        (0xBE, false) => Some(('.', '。')),
+        (0xBE, true) => Some(('>', '＞')),
+        (0xBC, false) => Some((',', '、')),
+        (0xBC, true) => Some(('<', '＜')),
+        (0xBF, false) => Some(('/', '・')),
+        (0xBF, true) => Some(('?', '？')),
+        (0xBA, false) => Some((':', '：')),
+        (0xBA, true) => Some(('*', '＊')),
+        (0xBB, false) => Some((';', '；')),
+        (0xBB, true) => Some(('+', '＋')),
+        (0xBD, false) => Some(('-', 'ー')),
+        (0xBD, true) => Some(('=', '＝')),
+        (0xDB, false) => Some(('[', '「')),
+        (0xDB, true) => Some(('{', '｛')),
+        (0xDD, false) => Some((']', '」')),
+        (0xDD, true) => Some(('}', '｝')),
+        (0x31, true) => Some(('!', '！')),
         _ => None,
     }
 }
@@ -288,7 +309,9 @@ impl AkazaTextService {
 
     fn unadvise_key_event_sink(this: &AkazaTextService_Impl) -> Result<()> {
         let thread_mgr = this.thread_mgr.borrow();
-        let thread_mgr = thread_mgr.as_ref().unwrap();
+        let Some(thread_mgr) = thread_mgr.as_ref() else {
+            return Ok(());
+        };
         let keystroke_mgr: ITfKeystrokeMgr = thread_mgr.cast()?;
         unsafe { keystroke_mgr.UnadviseKeyEventSink(*this.client_id.borrow()) }
     }
@@ -313,11 +336,26 @@ impl AkazaTextService {
             return Some(KeyAction::Command("set_input_mode_hiragana".to_string()));
         }
 
+        // Ctrl+英字 (Ctrl+V, Ctrl+C, Ctrl+A など) はアプリに渡す
+        if ctrl && (0x41..=0x5A).contains(&vk) {
+            return None;
+        }
+
         // 1. VK → キー名があればキーマップで検索
         if let Some(key_name) = vk_to_key_name(vk) {
             if let Some(cmd) = lookup_keymap(key_state, key_name, ctrl, shift) {
                 return Some(KeyAction::Command(cmd));
             }
+        }
+
+        // 1.5. 数字キー (0-9) — キーマップにコマンドがなければ全角数字として入力
+        if (0x30..=0x39).contains(&vk) && !shift {
+            if state.mode == InputMode::Hiragana || state.mode == InputMode::Converting {
+                let half = (vk as u8) as char; // '0'-'9'
+                let full = char::from_u32('０' as u32 + (vk - 0x30)).unwrap();
+                return Some(KeyAction::Punctuation(half, full));
+            }
+            return None;
         }
 
         // 2. アルファベット (A-Z) — キーマップにコマンドがあればそちら優先
@@ -335,7 +373,7 @@ impl AkazaTextService {
         }
 
         // 3. 句読点・記号
-        if let Some((ascii_ch, fallback_ch)) = vk_to_punct(vk) {
+        if let Some((ascii_ch, fallback_ch)) = vk_to_punct(vk, shift) {
             if state.mode == InputMode::Hiragana || !state.is_empty() {
                 return Some(KeyAction::Punctuation(ascii_ch, fallback_ch));
             }
@@ -417,8 +455,7 @@ impl AkazaTextService {
 
             state.romaji_buffer.push(ch);
 
-            if let Some(romkan) = romkan() {
-                let converted = romkan.to_hiragana(&state.romaji_buffer);
+            if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                 if converted != state.romaji_buffer {
                     let (kana, pending) = split_kana_pending(&converted, &state.romaji_buffer);
                     if !kana.is_empty() {
@@ -444,8 +481,7 @@ impl AkazaTextService {
                 self.handle_commit(context)?;
                 let mut state = self.state.borrow_mut();
                 state.romaji_buffer.push(ascii_ch);
-                if let Some(romkan) = romkan() {
-                    let converted = romkan.to_hiragana(&state.romaji_buffer);
+                if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                     if converted != state.romaji_buffer {
                         let (kana, pending) =
                             split_kana_pending(&converted, &state.romaji_buffer);
@@ -466,8 +502,7 @@ impl AkazaTextService {
             }
 
             state.romaji_buffer.push(ascii_ch);
-            if let Some(romkan) = romkan() {
-                let converted = romkan.to_hiragana(&state.romaji_buffer);
+            if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                 if converted != state.romaji_buffer {
                     let (kana, pending) = split_kana_pending(&converted, &state.romaji_buffer);
                     if !kana.is_empty() {
@@ -477,8 +512,9 @@ impl AkazaTextService {
                 } else {
                     state.romaji_buffer.pop();
                     if !state.romaji_buffer.is_empty() {
-                        let flushed = romkan.to_hiragana(&state.romaji_buffer);
-                        state.preedit.push_str(&flushed);
+                        if let Some(flushed) = romkan_convert(&state.romaji_buffer) {
+                            state.preedit.push_str(&flushed);
+                        }
                         state.romaji_buffer.clear();
                     }
                     state.preedit.push(fallback_ch);
@@ -507,8 +543,7 @@ impl AkazaTextService {
         }
 
         if !state.romaji_buffer.is_empty() {
-            if let Some(romkan) = romkan() {
-                let converted = romkan.to_hiragana(&state.romaji_buffer);
+            if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                 state.preedit.push_str(&converted);
                 state.romaji_buffer.clear();
             }
@@ -621,8 +656,7 @@ impl AkazaTextService {
             }
             // ローマ字バッファをフラッシュ
             if !state.romaji_buffer.is_empty() {
-                if let Some(romkan) = romkan() {
-                    let converted = romkan.to_hiragana(&state.romaji_buffer);
+                if let Some(converted) = romkan_convert(&state.romaji_buffer) {
                     state.preedit.push_str(&converted);
                     state.romaji_buffer.clear();
                 }
@@ -995,11 +1029,38 @@ impl ITfTextInputProcessor_Impl for AkazaTextService_Impl {
 
     fn Deactivate(&self) -> Result<()> {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log("Deactivate: start");
+
+            // アクティブなコンポジションがあれば EndComposition で終了する
+            if let Ok(mut comp_ref) = self.composition.try_borrow_mut() {
+                if let Some(comp) = comp_ref.take() {
+                    let client_id = *self.client_id.borrow();
+                    let thread_mgr = self.thread_mgr.borrow();
+                    if let Some(thread_mgr) = thread_mgr.as_ref() {
+                        if let Ok(doc_mgr) = unsafe { thread_mgr.GetFocus() } {
+                            if let Ok(context) = unsafe { doc_mgr.GetTop() } {
+                                let _ = EditSession::execute(
+                                    &context,
+                                    client_id,
+                                    TF_ES_READWRITE,
+                                    move |_ctx, ec| unsafe {
+                                        let _ = comp.EndComposition(ec);
+                                        Ok(())
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             let _ = AkazaTextService::unadvise_key_event_sink(self);
-            let _ = self.composition.try_borrow_mut().map(|mut c| c.take());
             self.state.borrow_mut().reset();
             *self.thread_mgr.borrow_mut() = None;
             *self.client_id.borrow_mut() = 0;
+            // 次回 Activate 時にエンジン・キーマップ・romkan を再読み込み
+            invalidate_engine();
+            log("Deactivate: done");
         }));
         Ok(())
     }
